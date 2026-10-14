@@ -148,9 +148,32 @@ format_pair() {
     fi
 }
 
-# Loads an Environment with `op run --environment` inside an otherwise empty
-# environment and keeps only the pairs the Environment added or changed, so
-# nothing from the caller's shell leaks into the file.
+# Runs op with only the variables the CLI itself needs: PATH, HOME, every
+# OP_* variable (service-account token, OP_ACCOUNT, OP_SESSION_* from an
+# interactive signin, Connect settings), the XDG and DBus settings the
+# desktop-app integration uses, and any names in OP_ENV_PASSTHROUGH.
+#
+# The environment is pruned with `unset` in a subshell rather than rebuilt with
+# `env -i NAME=value`, so the token travels in the process environment (readable
+# only by this user and root), never as a command-line argument that any user
+# on the host can read with ps or /proc/*/cmdline.
+run_op_clean() {
+    (
+        export HOME="${HOME:-/tmp}"
+        local name keep=" PATH HOME XDG_CONFIG_HOME XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS ${OP_ENV_PASSTHROUGH:-} "
+        for name in $(compgen -e); do
+            [[ "$name" == OP_* || "$keep" == *" $name "* ]] && continue
+            unset "$name" 2>/dev/null || true
+        done
+        unset OP_ENV_OP OP_ENV_MAP
+        exec "$OP_BIN" "$@"
+    )
+}
+
+# Loads an Environment with `op run --environment` inside a pruned environment
+# and keeps only the pairs the Environment added or changed, so nothing from
+# the caller's shell leaks into the file. The comparison happens in bash, so
+# no secret value is ever passed to an external command as an argument.
 #
 # Always called in a command substitution, so the EXIT trap below fires in
 # that subshell on success AND on die(): the scratch files hold secret values
@@ -163,38 +186,19 @@ resolve_environment() {
     # shellcheck disable=SC2064
     trap "rm -rf '$scratch'" EXIT
 
-    # Only what the CLI itself needs crosses into the clean environment: every
-    # OP_* variable (service-account token, OP_ACCOUNT, OP_SESSION_* from an
-    # interactive signin, Connect settings), the XDG and DBus settings the
-    # desktop-app integration uses, and any names in OP_ENV_PASSTHROUGH. They
-    # appear identically in both runs, so the baseline comparison drops them.
-    local -a clean_env=(env -i "PATH=$PATH" "HOME=${HOME:-/tmp}")
-    local name
-    for name in $(compgen -e); do
-        case " $name " in
-            " OP_ENV_OP "|" OP_ENV_MAP ") continue ;;
-        esac
-        if [[ "$name" == OP_* ]] || [[ " XDG_CONFIG_HOME XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS ${OP_ENV_PASSTHROUGH:-} " == *" $name "* ]]; then
-            clean_env+=("$name=${!name}")
-        fi
-    done
-
-    "${clean_env[@]}" "$OP_BIN" run --no-masking -- env -0 > "$baseline" \
+    run_op_clean run --no-masking -- env -0 > "$baseline" \
         || die "$label: 'op run' failed while recording the baseline environment"
-    "${clean_env[@]}" "$OP_BIN" run --no-masking --environment "$id" -- env -0 > "$loaded" \
+    run_op_clean run --no-masking --environment "$id" -- env -0 > "$loaded" \
         || die "$label: could not load 1Password Environment $id (check the ID and the service account's access)"
+
+    local -A in_baseline=()
+    while IFS= read -r -d '' pair; do
+        in_baseline["$pair"]=1
+    done < "$baseline"
 
     : > "$out"
     while IFS= read -r -d '' pair; do
-        # Refuse multi-line values before the baseline comparison: grep -F
-        # treats a newline in the pattern as several patterns, which could
-        # silently drop the pair instead of failing loudly.
-        case "$pair" in
-            *$'\n'*) die "$label: ${pair%%=*} contains a newline, which an env_file cannot hold" ;;
-        esac
-        if grep -qxzF -- "$pair" "$baseline"; then
-            continue
-        fi
+        [ -n "${in_baseline["$pair"]+set}" ] && continue
         key="${pair%%=*}"
         value="${pair#*=}"
         format_pair "$key" "$value" "$label" >> "$out"
@@ -295,6 +299,7 @@ cmd_export_bws() {
 }
 
 main() {
+    (( BASH_VERSINFO[0] >= 4 )) || die "bash 4 or later is required (associative arrays, mapfile)"
     while getopts ":m:C:h" opt; do
         case "$opt" in
             m) MAP_FILE="$OPTARG" ;;

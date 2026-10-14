@@ -10,6 +10,8 @@
 set -euo pipefail
 
 stub_dir="${OP_ENV_STUB_DIR:?OP_ENV_STUB_DIR must be set for the op stub}"
+# Record our own argv so the tests can prove no secret is ever passed as one.
+printf 'op %s\n' "$*" >> "$stub_dir/argv.log"
 
 case "${1:-}" in
     --version) echo "2.41.0"; exit 0 ;;

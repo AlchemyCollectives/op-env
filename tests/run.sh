@@ -135,4 +135,23 @@ run_op_env clean production 2>/dev/null
 [ ! -f traefik/prod.env ] || fail "clean did not remove the file"
 pass "output override, list (no secrets) and clean"
 
+# --- secrets never appear in any process's arguments ----------------------
+# Wrappers for every external command op-env could hand a value to log their
+# argv; ps and /proc/*/cmdline expose argv to every user on the host.
+new_workspace
+SHIM="$WS/shim"; mkdir -p "$SHIM"
+for tool in env grep jq; do
+    real="$(command -v "$tool")"
+    printf '#!/usr/bin/env bash\nprintf "%%s %%s\\n" "%s" "$*" >> "%s/argv.log"\nexec "%s" "$@"\n' \
+        "$tool" "$OP_ENV_STUB_DIR" "$real" > "$SHIM/$tool"
+    chmod +x "$SHIM/$tool"
+done
+fixture envtraefik0001 "CF_DNS_API_TOKEN=val-SENTINEL-456"
+write_map '{"environments":{"production":{"traefik":{"environment":"envtraefik0001"}}}}'
+OP_SERVICE_ACCOUNT_TOKEN=tok-SENTINEL-123 PATH="$SHIM:$PATH" run_op_env pull production 2>/dev/null
+grep -qx 'CF_DNS_API_TOKEN=val-SENTINEL-456' traefik/.env || fail "argv test: pull did not write the value"
+[ -s "$OP_ENV_STUB_DIR/argv.log" ] || fail "argv test: no commands were logged"
+if grep -q SENTINEL "$OP_ENV_STUB_DIR/argv.log"; then fail "a secret or the token appeared in a process argument"; fi
+pass "neither the token nor any secret value is passed as a process argument"
+
 printf '\n%d passed\n' "$passed"

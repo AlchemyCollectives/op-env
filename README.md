@@ -113,8 +113,8 @@ A `check` step needs no token and no CLI, so it suits a pull-request lint job:
 ## Using the script outside Actions
 
 Copy `bin/op-env` from a tagged release into the consuming repo (for example
-`scripts/op-env`) and call it from your deploy script. It needs `bash`, `jq` and
-the 1Password CLI.
+`scripts/op-env`) and call it from your deploy script. It needs bash 4 or
+later, `jq` and the 1Password CLI.
 
 ## How Environment values are written
 
@@ -122,6 +122,11 @@ the 1Password CLI.
 an otherwise empty environment, once without the Environment and once with it,
 and keeps only the pairs the Environment added or changed. Nothing from the
 caller's shell can leak into the file.
+
+No secret is ever passed as a command-line argument, where any user on the
+host could read it with `ps`: the token reaches `op` through its environment,
+and the comparison happens inside bash. A test proves this by logging the
+arguments of every external command during a pull.
 
 Values are written for docker compose's `env_file`:
 
