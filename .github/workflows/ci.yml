@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: shellcheck
+        run: shellcheck -x bin/op-env tests/run.sh tests/stub/op
+      - name: tests
+        run: bash tests/run.sh
+      - name: action check mode runs offline
+        uses: ./
+        with:
+          command: check
+          map: examples/environments.json

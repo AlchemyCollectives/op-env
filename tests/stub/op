@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Test double for the 1Password CLI. Implements only what op-env calls:
+#   op --version
+#   op run [--no-masking] [--environment ID]... -- cmd...
+#       Exports every NUL-separated KEY=VALUE pair in $OP_ENV_STUB_DIR/env/<ID>.env0
+#       and, like the real CLI, injects a variable of its own (STUB_INJECTED).
+#   op inject --in-file T --out-file O [--force]
+#       Replaces each {{ op://... }} with its value from $OP_ENV_STUB_DIR/refs
+#       (lines of the form op://vault/item/field=value).
+set -euo pipefail
+
+stub_dir="${OP_ENV_STUB_DIR:?OP_ENV_STUB_DIR must be set for the op stub}"
+
+case "${1:-}" in
+    --version) echo "2.41.0"; exit 0 ;;
+    run)
+        shift
+        ids=()
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --no-masking) shift ;;
+                --environment) ids+=("$2"); shift 2 ;;
+                --) shift; break ;;
+                *) echo "op stub: unexpected run flag $1" >&2; exit 2 ;;
+            esac
+        done
+        export STUB_INJECTED=from-op
+        for id in "${ids[@]+"${ids[@]}"}"; do
+            file="$stub_dir/env/$id.env0"
+            [ -f "$file" ] || { echo "[ERROR] environment $id not found" >&2; exit 1; }
+            while IFS= read -r -d '' pair; do
+                export "${pair%%=*}=${pair#*=}"
+            done < "$file"
+        done
+        exec "$@"
+        ;;
+    inject)
+        shift
+        in_file="" out_file=""
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --in-file) in_file="$2"; shift 2 ;;
+                --out-file) out_file="$2"; shift 2 ;;
+                --force) shift ;;
+                *) echo "op stub: unexpected inject flag $1" >&2; exit 2 ;;
+            esac
+        done
+        : > "$out_file"
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=\{\{\ (op://[^ ]+)\ \}\}$ ]]; then
+                ref="${BASH_REMATCH[2]}"
+                value="$(grep -F "$ref=" "$stub_dir/refs" | head -1 | cut -d= -f2-)"
+                [ -n "$value" ] || { echo "[ERROR] could not resolve $ref" >&2; exit 1; }
+                printf '%s=%s\n' "${BASH_REMATCH[1]}" "$value" >> "$out_file"
+            else
+                printf '%s\n' "$line" >> "$out_file"
+            fi
+        done < "$in_file"
+        ;;
+    *) echo "op stub: unsupported command ${1:-}" >&2; exit 2 ;;
+esac

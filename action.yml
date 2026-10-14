@@ -1,0 +1,63 @@
+name: op-env
+description: Write .env files from 1Password Environments or op inject templates, driven by a committed map.
+author: Alchemy Collectives
+branding:
+  icon: lock
+  color: blue
+
+inputs:
+  command:
+    description: "pull (write .env files), clean (delete them) or check (validate the map offline)."
+    default: pull
+  environment:
+    description: "Environment name in the map, e.g. production. Required for pull and clean."
+    default: ""
+  stacks:
+    description: "Space-separated stacks to act on. Default: every stack in the environment."
+    default: ""
+  map:
+    description: "Path to the map file, relative to working-directory."
+    default: environments.json
+  working-directory:
+    description: "Directory the map's paths are relative to."
+    default: "."
+  op-version:
+    description: "1Password CLI version to install. 2.41.0 or later supports op run --environment."
+    default: "2.41.0"
+  install-cli:
+    description: "Install the 1Password CLI first. Set to false when the runner already has it."
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Install 1Password CLI
+      if: inputs.install-cli == 'true' && inputs.command != 'check'
+      uses: 1password/install-cli-action@1a3160d5e9de1ae0803eaa08a88746f5ae3daa50 # v4.1.0
+      with:
+        version: ${{ inputs.op-version }}
+
+    # Inputs reach the script through env, never spliced into the shell text,
+    # so a caller-supplied value cannot inject commands.
+    - name: op-env ${{ inputs.command }}
+      shell: bash
+      env:
+        OP_ENV_COMMAND: ${{ inputs.command }}
+        OP_ENV_ENVIRONMENT: ${{ inputs.environment }}
+        OP_ENV_STACKS: ${{ inputs.stacks }}
+        OP_ENV_MAP_INPUT: ${{ inputs.map }}
+        OP_ENV_DIR: ${{ inputs.working-directory }}
+        OP_ENV_BIN: ${{ github.action_path }}/bin/op-env
+      run: |
+        set -euo pipefail
+        args=(-m "$OP_ENV_MAP_INPUT" -C "$OP_ENV_DIR" "$OP_ENV_COMMAND")
+        if [ "$OP_ENV_COMMAND" = "pull" ] || [ "$OP_ENV_COMMAND" = "clean" ]; then
+          [ -n "$OP_ENV_ENVIRONMENT" ] || { echo "::error::op-env: the environment input is required for $OP_ENV_COMMAND"; exit 1; }
+          args+=("$OP_ENV_ENVIRONMENT")
+          # Word-splitting the stack list is intended: it is space-separated.
+          # shellcheck disable=SC2206
+          [ -n "$OP_ENV_STACKS" ] && args+=($OP_ENV_STACKS)
+        elif [ -n "$OP_ENV_ENVIRONMENT" ]; then
+          args+=("$OP_ENV_ENVIRONMENT")
+        fi
+        "$OP_ENV_BIN" "${args[@]}"

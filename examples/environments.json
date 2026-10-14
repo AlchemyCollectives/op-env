@@ -1,0 +1,12 @@
+{
+  "environments": {
+    "production": {
+      "_shared": { "environment": "replacewithenvironmentid01" },
+      "traefik": { "environment": "replacewithenvironmentid02" }
+    },
+    "development": {
+      "_shared": { "environment": "replacewithenvironmentid03" },
+      "traefik": { "environment": "replacewithenvironmentid04" }
+    }
+  }
+}

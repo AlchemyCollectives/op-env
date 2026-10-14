@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# op-env: write .env files from 1Password, driven by a committed map.
+#
+# Each entry in the map names ONE source for one output file:
+#   - "environment": the ID of a 1Password Environment, loaded with the stable
+#     `op run --environment` (no beta CLI needed), or
+#   - "template": a committed file of `{{ op://vault/item/field }}` references,
+#     resolved with `op inject`.
+#
+# Map file (default: environments.json in the working directory):
+#   {
+#     "environments": {
+#       "production": {
+#         "_shared":  { "environment": "<id>" },
+#         "traefik":  { "environment": "<id>" },
+#         "metabase": { "template": "metabase/.env.tpl" }
+#       }
+#     }
+#   }
+# Output paths: "_shared" writes ./.env, any other stack writes ./<stack>/.env.
+# Either can be overridden with "output": "<relative path>".
+#
+# Secret values are never printed. Every written file is mode 600, written to a
+# temporary file first and moved into place, and any failure exits non-zero so
+# a deploy never runs with a missing or partial .env.
+set -euo pipefail
+
+OP_ENV_VERSION="1.0.0"
+OP_BIN="${OP_ENV_OP:-op}"
+MAP_FILE="${OP_ENV_MAP:-environments.json}"
+WORK_DIR="."
+
+usage() {
+    cat <<'EOF'
+Usage: op-env [-m MAP] [-C DIR] <command> [args]
+
+Commands:
+  pull  <env> [stack...]   Write the .env file for each stack (default: all stacks in <env>)
+  clean <env> [stack...]   Delete the .env files that pull writes
+  list  <env>              Show each stack, its source kind and output path (no secrets)
+  check [env]              Validate the map and templates without contacting 1Password
+  export-bws <out-dir>     One-off migration: write each Bitwarden Secrets Manager secret
+                           in $BWS_PROJECT_ID to <out-dir>/<key>.env for import into 1Password
+  version                  Print the op-env version
+
+Options:
+  -m MAP   Map file (default: environments.json, or $OP_ENV_MAP)
+  -C DIR   Run as if started in DIR (paths in the map are relative to it)
+
+Environment:
+  OP_SERVICE_ACCOUNT_TOKEN  1Password service account token (or an interactive `op signin`)
+  OP_ENV_OP                 Path to the op binary (default: op)
+  OP_ENV_PASSTHROUGH        Extra variable names to pass to op (space-separated)
+EOF
+}
+
+die() { printf 'op-env: error: %s\n' "$*" >&2; exit 1; }
+info() { printf 'op-env: %s\n' "$*" >&2; }
+
+require_tools() {
+    command -v jq >/dev/null 2>&1 || die "jq is required"
+    command -v "$OP_BIN" >/dev/null 2>&1 || die "1Password CLI not found ('$OP_BIN'); install op 2.41.0 or later"
+}
+
+# The map is read once and validated for shape before any command uses it.
+load_map() {
+    [ -f "$MAP_FILE" ] || die "map file not found: $MAP_FILE"
+    jq -e 'type == "object" and (.environments | type == "object")' "$MAP_FILE" >/dev/null 2>&1 \
+        || die "$MAP_FILE must be a JSON object with an \"environments\" object"
+}
+
+env_exists() {
+    jq -e --arg env "$1" '.environments[$env] | type == "object"' "$MAP_FILE" >/dev/null 2>&1
+}
+
+list_stacks() {
+    jq -r --arg env "$1" '.environments[$env] | keys[]' "$MAP_FILE"
+}
+
+entry_field() {
+    jq -r --arg env "$1" --arg stack "$2" --arg field "$3" \
+        '.environments[$env][$stack][$field] // empty' "$MAP_FILE"
+}
+
+output_path() {
+    local env="$1" stack="$2" custom
+    custom="$(entry_field "$env" "$stack" output)"
+    if [ -n "$custom" ]; then
+        printf '%s' "$custom"
+    elif [ "$stack" = "_shared" ]; then
+        printf '.env'
+    else
+        printf '%s/.env' "$stack"
+    fi
+}
+
+# Validates one entry and prints "environment" or "template". Exits on error.
+entry_kind() {
+    local env="$1" stack="$2" id tpl
+    jq -e --arg env "$env" --arg stack "$stack" '.environments[$env][$stack] | type == "object"' \
+        "$MAP_FILE" >/dev/null 2>&1 || die "$env/$stack: no such entry in $MAP_FILE"
+    id="$(entry_field "$env" "$stack" environment)"
+    tpl="$(entry_field "$env" "$stack" template)"
+    if [ -n "$id" ] && [ -n "$tpl" ]; then
+        die "$env/$stack: set either \"environment\" or \"template\", not both"
+    elif [ -n "$id" ]; then
+        [[ "$id" =~ ^[A-Za-z0-9]{10,64}$ ]] || die "$env/$stack: \"environment\" does not look like a 1Password Environment ID"
+        printf 'environment'
+    elif [ -n "$tpl" ]; then
+        printf 'template'
+    else
+        die "$env/$stack: entry needs an \"environment\" ID or a \"template\" path"
+    fi
+}
+
+# Every non-comment line must be KEY={{ op://vault/item/field }} so a template
+# can never smuggle a plaintext secret into the repo.
+check_template() {
+    local label="$1" file="$2" line n=0 bad=0
+    [ -f "$file" ] || die "$label: template not found: $file"
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        case "$line" in ''|'#'*) continue ;; esac
+        if ! [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=\{\{\ op://[^[:space:]\}]+/[^[:space:]\}]+/[^[:space:]\}]+\ \}\}$ ]]; then
+            printf 'op-env: error: %s: line %d is not KEY={{ op://vault/item/field }}\n' "$file" "$n" >&2
+            bad=1
+        fi
+    done < "$file"
+    [ "$bad" -eq 0 ] || exit 1
+}
+
+# Formats one KEY=VALUE pair for a docker compose env_file. Plain values are
+# written as-is; anything compose could reinterpret (spaces, $, #, quotes) is
+# single-quoted, which compose takes literally. A value compose cannot carry
+# safely (a newline, or a single quote) is refused, naming only the key.
+format_pair() {
+    local key="$1" value="$2" label="$3"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "$label: variable name '$key' is not a valid env_file key"
+    case "$value" in
+        *$'\n'*) die "$label: $key contains a newline, which an env_file cannot hold" ;;
+    esac
+    if [[ "$value" =~ ^[A-Za-z0-9_./:@%+,=-]*$ ]]; then
+        printf '%s=%s\n' "$key" "$value"
+    elif [[ "$value" != *"'"* ]]; then
+        printf "%s='%s'\n" "$key" "$value"
+    else
+        die "$label: $key contains a single quote alongside characters that need quoting; an env_file cannot hold it literally"
+    fi
+}
+
+# Loads an Environment with `op run --environment` inside an otherwise empty
+# environment and keeps only the pairs the Environment added or changed, so
+# nothing from the caller's shell leaks into the file.
+#
+# Always called in a command substitution, so the EXIT trap below fires in
+# that subshell on success AND on die(): the scratch files hold secret values
+# (and the token, in the baseline) and must never outlive the call.
+resolve_environment() {
+    local id="$1" out="$2" label="$3" scratch baseline loaded pair key value count=0
+    scratch="$(umask 077 && mktemp -d)"
+    baseline="$scratch/baseline"
+    loaded="$scratch/loaded"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$scratch'" EXIT
+
+    # Only what the CLI itself needs crosses into the clean environment: every
+    # OP_* variable (service-account token, OP_ACCOUNT, OP_SESSION_* from an
+    # interactive signin, Connect settings), the XDG and DBus settings the
+    # desktop-app integration uses, and any names in OP_ENV_PASSTHROUGH. They
+    # appear identically in both runs, so the baseline comparison drops them.
+    local -a clean_env=(env -i "PATH=$PATH" "HOME=${HOME:-/tmp}")
+    local name
+    for name in $(compgen -e); do
+        case " $name " in
+            " OP_ENV_OP "|" OP_ENV_MAP ") continue ;;
+        esac
+        if [[ "$name" == OP_* ]] || [[ " XDG_CONFIG_HOME XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS ${OP_ENV_PASSTHROUGH:-} " == *" $name "* ]]; then
+            clean_env+=("$name=${!name}")
+        fi
+    done
+
+    "${clean_env[@]}" "$OP_BIN" run --no-masking -- env -0 > "$baseline" \
+        || die "$label: 'op run' failed while recording the baseline environment"
+    "${clean_env[@]}" "$OP_BIN" run --no-masking --environment "$id" -- env -0 > "$loaded" \
+        || die "$label: could not load 1Password Environment $id (check the ID and the service account's access)"
+
+    : > "$out"
+    while IFS= read -r -d '' pair; do
+        # Refuse multi-line values before the baseline comparison: grep -F
+        # treats a newline in the pattern as several patterns, which could
+        # silently drop the pair instead of failing loudly.
+        case "$pair" in
+            *$'\n'*) die "$label: ${pair%%=*} contains a newline, which an env_file cannot hold" ;;
+        esac
+        if grep -qxzF -- "$pair" "$baseline"; then
+            continue
+        fi
+        key="${pair%%=*}"
+        value="${pair#*=}"
+        format_pair "$key" "$value" "$label" >> "$out"
+        count=$((count + 1))
+    done < "$loaded"
+    [ "$count" -gt 0 ] || die "$label: Environment $id returned no variables"
+    printf '%d' "$count"
+}
+
+resolve_template() {
+    local tpl="$1" out="$2" label="$3"
+    check_template "$label" "$tpl"
+    "$OP_BIN" inject --in-file "$tpl" --out-file "$out" --force >/dev/null \
+        || die "$label: 'op inject' failed for $tpl"
+    grep -cvE '^(#|$)' "$out" || true
+}
+
+cmd_pull() {
+    local env="$1"; shift
+    env_exists "$env" || die "no environment '$env' in $MAP_FILE"
+    local -a stacks
+    if [ "$#" -gt 0 ]; then stacks=("$@"); else mapfile -t stacks < <(list_stacks "$env"); fi
+    [ "${#stacks[@]}" -gt 0 ] || die "environment '$env' has no stacks"
+
+    local stack kind out dir tmp count
+    for stack in "${stacks[@]}"; do
+        kind="$(entry_kind "$env" "$stack")"
+        out="$(output_path "$env" "$stack")"
+        dir="$(dirname "$out")"
+        [ -d "$dir" ] || die "$env/$stack: output directory '$dir' does not exist"
+        tmp="$(umask 077 && mktemp "$dir/.op-env.XXXXXX")"
+        if [ "$kind" = "environment" ]; then
+            count="$(resolve_environment "$(entry_field "$env" "$stack" environment)" "$tmp" "$env/$stack")" \
+                || { rm -f "$tmp"; exit 1; }
+        else
+            count="$(resolve_template "$(entry_field "$env" "$stack" template)" "$tmp" "$env/$stack")" \
+                || { rm -f "$tmp"; exit 1; }
+        fi
+        chmod 600 "$tmp"
+        mv -f "$tmp" "$out"
+        info "wrote $out ($count variables, from $kind)"
+    done
+}
+
+cmd_clean() {
+    local env="$1"; shift
+    env_exists "$env" || die "no environment '$env' in $MAP_FILE"
+    local -a stacks
+    if [ "$#" -gt 0 ]; then stacks=("$@"); else mapfile -t stacks < <(list_stacks "$env"); fi
+    local stack out
+    for stack in "${stacks[@]}"; do
+        out="$(output_path "$env" "$stack")"
+        if [ -f "$out" ]; then rm -f "$out"; info "removed $out"; fi
+    done
+}
+
+cmd_list() {
+    local env="$1" stack
+    env_exists "$env" || die "no environment '$env' in $MAP_FILE"
+    while IFS= read -r stack; do
+        printf '%-20s %-12s %s\n' "$stack" "$(entry_kind "$env" "$stack")" "$(output_path "$env" "$stack")"
+    done < <(list_stacks "$env")
+}
+
+cmd_check() {
+    local -a envs
+    if [ "$#" -gt 0 ]; then envs=("$@"); else mapfile -t envs < <(jq -r '.environments | keys[]' "$MAP_FILE"); fi
+    local env stack kind n=0
+    for env in "${envs[@]}"; do
+        env_exists "$env" || die "no environment '$env' in $MAP_FILE"
+        while IFS= read -r stack; do
+            kind="$(entry_kind "$env" "$stack")"
+            [ "$kind" = "template" ] && check_template "$env/$stack" "$(entry_field "$env" "$stack" template)"
+            n=$((n + 1))
+        done < <(list_stacks "$env")
+    done
+    info "map OK: $n entries across ${#envs[@]} environment(s)"
+}
+
+# One-off migration helper. Reads every secret in a Bitwarden Secrets Manager
+# project and writes its value, unchanged, to <out-dir>/<key>.env (dir 700,
+# files 600) so each can be imported into a 1Password Environment with
+# "Import .env file". Values are never printed. Delete the directory after.
+cmd_export_bws() {
+    local out_dir="$1" json key
+    command -v bws >/dev/null 2>&1 || die "the bws CLI is required for export-bws"
+    [ -n "${BWS_ACCESS_TOKEN:-}" ] || die "BWS_ACCESS_TOKEN is not set"
+    [ -n "${BWS_PROJECT_ID:-}" ] || die "BWS_PROJECT_ID is not set"
+    [ ! -e "$out_dir" ] || die "$out_dir already exists; choose a new directory"
+    (umask 077 && mkdir -p "$out_dir")
+    json="$(bws secret list "$BWS_PROJECT_ID" --output json)" || die "bws secret list failed"
+    while IFS= read -r key; do
+        [[ "$key" =~ ^[A-Za-z0-9_.-]+$ ]] || die "unexpected secret key '$key'"
+        (umask 077 && jq -r --arg key "$key" '.[] | select(.key == $key) | .value' <<<"$json" > "$out_dir/$key.env")
+        info "exported $key -> $out_dir/$key.env"
+    done < <(jq -r '.[].key' <<<"$json")
+    info "import each file in 1Password (Developer > Environments > Import .env file), then delete $out_dir"
+}
+
+main() {
+    while getopts ":m:C:h" opt; do
+        case "$opt" in
+            m) MAP_FILE="$OPTARG" ;;
+            C) WORK_DIR="$OPTARG" ;;
+            h) usage; exit 0 ;;
+            *) usage >&2; exit 2 ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+    cd "$WORK_DIR" || die "cannot enter $WORK_DIR"
+
+    local command="$1"; shift
+    case "$command" in
+        version) printf '%s\n' "$OP_ENV_VERSION" ;;
+        pull)  [ "$#" -ge 1 ] || die "usage: op-env pull <env> [stack...]";  require_tools; load_map; cmd_pull "$@" ;;
+        clean) [ "$#" -ge 1 ] || die "usage: op-env clean <env> [stack...]"; command -v jq >/dev/null || die "jq is required"; load_map; cmd_clean "$@" ;;
+        list)  [ "$#" -eq 1 ] || die "usage: op-env list <env>";             command -v jq >/dev/null || die "jq is required"; load_map; cmd_list "$1" ;;
+        check) command -v jq >/dev/null || die "jq is required"; load_map; cmd_check "$@" ;;
+        export-bws) [ "$#" -eq 1 ] || die "usage: op-env export-bws <out-dir>"; command -v jq >/dev/null || die "jq is required"; cmd_export_bws "$1" ;;
+        help|-h|--help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"
