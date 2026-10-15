@@ -2,7 +2,8 @@
 # op-env: write .env files from 1Password, driven by a committed map.
 #
 # Each entry in the map names ONE source for one output file:
-#   - "environment": the ID of a 1Password Environment, loaded with the stable
+#   - "environment": the ID of a 1Password Environment, or a list of IDs merged
+#     in order (the last wins on a clash), loaded with the stable
 #     `op run --environment` (no beta CLI needed), or
 #   - "template": a committed file of `{{ op://vault/item/field }}` references,
 #     resolved with `op inject`.
@@ -94,17 +95,42 @@ output_path() {
     fi
 }
 
+# Prints an entry's Environment IDs, one per line. "environment" may be a
+# single ID or a list; with a list, `op run` merges them and the LAST one wins
+# for a variable defined twice, so ["<shared>", "<stack>"] lets a stack
+# override a shared value.
+entry_environment_ids() {
+    jq -r --arg env "$1" --arg stack "$2" '
+        .environments[$env][$stack].environment
+        | if type == "array" then .[] elif type == "string" then . else empty end' "$MAP_FILE"
+}
+
 # Validates one entry and prints "environment" or "template". Exits on error.
 entry_kind() {
-    local env="$1" stack="$2" id tpl
+    local env="$1" stack="$2" tpl env_type id count=0
     jq -e --arg env "$env" --arg stack "$stack" '.environments[$env][$stack] | type == "object"' \
         "$MAP_FILE" >/dev/null 2>&1 || die "$env/$stack: no such entry in $MAP_FILE"
-    id="$(entry_field "$env" "$stack" environment)"
+    env_type="$(jq -r --arg env "$env" --arg stack "$stack" \
+        '.environments[$env][$stack].environment | type' "$MAP_FILE")"
     tpl="$(entry_field "$env" "$stack" template)"
-    if [ -n "$id" ] && [ -n "$tpl" ]; then
+    case "$env_type" in
+        null) ;;
+        string|array) ;;
+        *) die "$env/$stack: \"environment\" must be an ID or a list of IDs" ;;
+    esac
+    if [ "$env_type" != "null" ] && [ -n "$tpl" ]; then
         die "$env/$stack: set either \"environment\" or \"template\", not both"
-    elif [ -n "$id" ]; then
-        [[ "$id" =~ ^[A-Za-z0-9]{10,64}$ ]] || die "$env/$stack: \"environment\" does not look like a 1Password Environment ID"
+    elif [ "$env_type" != "null" ]; then
+        if [ "$env_type" = "array" ]; then
+            jq -e --arg env "$env" --arg stack "$stack" \
+                '.environments[$env][$stack].environment | all(type == "string")' "$MAP_FILE" >/dev/null \
+                || die "$env/$stack: every item in the \"environment\" list must be an ID string"
+        fi
+        while IFS= read -r id; do
+            [[ "$id" =~ ^[A-Za-z0-9]{10,64}$ ]] || die "$env/$stack: \"$id\" does not look like a 1Password Environment ID"
+            count=$((count + 1))
+        done < <(entry_environment_ids "$env" "$stack")
+        [ "$count" -gt 0 ] || die "$env/$stack: \"environment\" is empty"
         printf 'environment'
     elif [ -n "$tpl" ]; then
         printf 'template'
@@ -179,7 +205,10 @@ run_op_clean() {
 # that subshell on success AND on die(): the scratch files hold secret values
 # (and the token, in the baseline) and must never outlive the call.
 resolve_environment() {
-    local id="$1" out="$2" label="$3" scratch baseline loaded pair key value count=0
+    local out="$1" label="$2"; shift 2
+    local -a ids=("$@") env_flags=()
+    local id scratch baseline loaded pair key value count=0
+    for id in "${ids[@]}"; do env_flags+=(--environment "$id"); done
     scratch="$(umask 077 && mktemp -d)"
     baseline="$scratch/baseline"
     loaded="$scratch/loaded"
@@ -188,8 +217,8 @@ resolve_environment() {
 
     run_op_clean run --no-masking -- env -0 > "$baseline" \
         || die "$label: 'op run' failed while recording the baseline environment"
-    run_op_clean run --no-masking --environment "$id" -- env -0 > "$loaded" \
-        || die "$label: could not load 1Password Environment $id (check the ID and the service account's access)"
+    run_op_clean run --no-masking "${env_flags[@]}" -- env -0 > "$loaded" \
+        || die "$label: could not load 1Password Environment(s) ${ids[*]} (check the IDs and the service account's access)"
 
     local -A in_baseline=()
     while IFS= read -r -d '' pair; do
@@ -204,7 +233,7 @@ resolve_environment() {
         format_pair "$key" "$value" "$label" >> "$out"
         count=$((count + 1))
     done < "$loaded"
-    [ "$count" -gt 0 ] || die "$label: Environment $id returned no variables"
+    [ "$count" -gt 0 ] || die "$label: Environment(s) ${ids[*]} returned no variables"
     printf '%d' "$count"
 }
 
@@ -224,6 +253,7 @@ cmd_pull() {
     [ "${#stacks[@]}" -gt 0 ] || die "environment '$env' has no stacks"
 
     local stack kind out dir tmp count
+    local -a ids
     for stack in "${stacks[@]}"; do
         kind="$(entry_kind "$env" "$stack")"
         out="$(output_path "$env" "$stack")"
@@ -231,7 +261,8 @@ cmd_pull() {
         [ -d "$dir" ] || die "$env/$stack: output directory '$dir' does not exist"
         tmp="$(umask 077 && mktemp "$dir/.op-env.XXXXXX")"
         if [ "$kind" = "environment" ]; then
-            count="$(resolve_environment "$(entry_field "$env" "$stack" environment)" "$tmp" "$env/$stack")" \
+            mapfile -t ids < <(entry_environment_ids "$env" "$stack")
+            count="$(resolve_environment "$tmp" "$env/$stack" "${ids[@]}")" \
                 || { rm -f "$tmp"; exit 1; }
         else
             count="$(resolve_template "$(entry_field "$env" "$stack" template)" "$tmp" "$env/$stack")" \

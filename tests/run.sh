@@ -65,6 +65,23 @@ run_op_env pull production traefik 2>/dev/null
 if [ ! -f traefik/.env ] || [ -f .env ]; then fail "pull <env> <stack> wrote the wrong files"; fi
 pass "pull <env> <stack> writes only that stack"
 
+# --- several Environments merge, the last one wins -------------------------
+new_workspace
+fixture envshared00001 "TZ=Europe/London" "DOMAIN=example.co.uk" "LOG_LEVEL=info"
+fixture envstack000001 "RABBITMQ_PASSWORD=s3cret" "LOG_LEVEL=debug"
+write_map '{"environments":{"production":{"traefik":{"environment":["envshared00001","envstack000001"]}}}}'
+run_op_env check 2>/dev/null || fail "check rejected a list of Environment IDs"
+run_op_env pull production 2>/dev/null
+grep -qx 'DOMAIN=example.co.uk' traefik/.env || fail "shared value missing from a merged .env"
+grep -qx 'RABBITMQ_PASSWORD=s3cret' traefik/.env || fail "stack value missing from a merged .env"
+grep -qx 'LOG_LEVEL=debug' traefik/.env || fail "the later Environment did not win on a clash"
+[ "$(grep -c '^LOG_LEVEL=' traefik/.env)" -eq 1 ] || fail "a clashing variable was written twice"
+write_map '{"environments":{"production":{"traefik":{"environment":[]}}}}'
+if run_op_env check 2>/dev/null; then fail "check accepted an empty Environment list"; fi
+write_map '{"environments":{"production":{"traefik":{"environment":["envshared00001", 7]}}}}'
+if run_op_env check 2>/dev/null; then fail "check accepted a non-string in the Environment list"; fi
+pass "a list of Environments merges into one .env, the last winning on a clash"
+
 # --- refusals leave nothing behind ---------------------------------------
 new_workspace
 fixture envquote000001 "BAD=it's spaced"
@@ -87,7 +104,7 @@ pass "a multi-line value is refused"
 new_workspace
 write_map '{"environments":{"production":{"traefik":{"environment":"envmissing0001"}}}}'
 if run_op_env pull production 2>err.txt; then fail "an unknown Environment ID was accepted"; fi
-grep -q "could not load 1Password Environment envmissing0001" err.txt || fail "unknown ID error unclear"
+grep -qF "could not load 1Password Environment(s) envmissing0001" err.txt || fail "unknown ID error unclear"
 assert_no_leftovers "unknown Environment"
 pass "an Environment the token cannot read fails the pull"
 

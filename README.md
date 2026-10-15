@@ -7,8 +7,9 @@ local runs all use the same map and the same code path.
 Each entry in the map names one source for one `.env` file:
 
 - **`environment`**: a [1Password Environment](https://www.1password.dev/environments)
-  ID. Loaded with the stable `op run --environment` (1Password CLI 2.41.0 or
-  later), so no beta CLI is needed.
+  ID, or a list of IDs merged in order (the last one wins when two define the
+  same variable). Loaded with the stable `op run --environment` (1Password CLI
+  2.41.0 or later), so no beta CLI is needed.
 - **`template`**: a committed file of `KEY={{ op://vault/item/field }}` lines,
   resolved with `op inject`. Use this for repos that already keep secrets as
   vault items.
@@ -38,6 +39,9 @@ deploy never starts with a missing or partial `.env`.
 ```
 
 - `_shared` writes `./.env`. Any other stack writes `./<stack>/.env`.
+- `"environment": ["<shared id>", "<stack id>"]` writes one `.env` holding both,
+  so compose can interpolate shared values such as `${DOMAIN}` from the stack's
+  own `.env`. The stack's Environment wins on a clash.
 - Add `"output": "path/to/file.env"` to an entry to write somewhere else.
 - Environment IDs are not secrets: they are useless without a token that has
   been granted access to that Environment.
