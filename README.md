@@ -118,7 +118,8 @@ A `check` step needs no token and no CLI, so it suits a pull-request lint job:
 
 Copy `bin/op-env` from a tagged release into the consuming repo (for example
 `scripts/op-env`) and call it from your deploy script. It needs bash 4 or
-later, `jq` and the 1Password CLI.
+later, GNU `env` (for `env -0`; Linux and Git Bash have it, stock macOS does
+not), `jq` and the 1Password CLI.
 
 ## How Environment values are written
 
